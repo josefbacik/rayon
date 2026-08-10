@@ -4,7 +4,7 @@
 use crate::latch::CoreLatch;
 use crate::sync::{Condvar, Mutex};
 use crossbeam_utils::CachePadded;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 mod counters;
@@ -24,6 +24,16 @@ pub(super) struct Sleep {
     worker_sleep_states: Vec<CachePadded<WorkerSleepState>>,
 
     counters: AtomicCounters,
+
+    /// Whether the pool looked idle to the most recent worker that
+    /// finished searching: set when a spinning worker's full sweep comes
+    /// up empty, cleared when any worker's search finds work before it
+    /// sleeps. Idle workers consult it to decide whether spinning is
+    /// currently worth it, so one worker's empty sweep spares the rest of
+    /// the pool from repeating it. Read-mostly; both transitions are
+    /// load-gated stores, so the line stays shared until the pool's state
+    /// actually changes.
+    pool_idle: CachePadded<AtomicBool>,
 }
 
 /// An instance of this struct is created when a thread becomes idle.
@@ -41,6 +51,13 @@ pub(super) struct IdleState {
     /// Once we become sleepy, what was the sleepy counter value?
     /// Set to `INVALID_SLEEPY_COUNTER` otherwise.
     jobs_counter: JobsEventCounter,
+
+    /// Whether this idle episode was granted the yield/steal spin rounds.
+    spun: bool,
+
+    /// Whether this idle episode reached the point of blocking on the
+    /// condvar.
+    pub(super) slept: bool,
 }
 
 /// The "sleep state" for an individual worker.
@@ -62,6 +79,14 @@ impl Sleep {
         Sleep {
             worker_sleep_states: (0..n_threads).map(|_| Default::default()).collect(),
             counters: AtomicCounters::new(),
+            pool_idle: CachePadded::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[inline]
+    fn set_pool_idle(&self, idle: bool) {
+        if self.pool_idle.load(Ordering::Relaxed) != idle {
+            self.pool_idle.store(idle, Ordering::Relaxed);
         }
     }
 
@@ -69,15 +94,29 @@ impl Sleep {
     pub(super) fn start_looking(&self, worker_index: usize) -> IdleState {
         self.counters.add_inactive_thread();
 
+        // While the pool looks idle -- some worker's full spin recently
+        // came up empty -- skip the yield/steal spin rounds and enter the
+        // sleepy protocol directly: announce via the JEC, one final
+        // search, then block. This is the stock protocol from round
+        // ROUNDS_UNTIL_SLEEPY on, so the no-lost-wakeup reasoning is
+        // unchanged.
+        let spun = !self.pool_idle.load(Ordering::Relaxed);
         IdleState {
             worker_index,
-            rounds: 0,
+            rounds: if spun { 0 } else { ROUNDS_UNTIL_SLEEPY },
             jobs_counter: JobsEventCounter::DUMMY,
+            spun,
+            slept: false,
         }
     }
 
     #[inline]
-    pub(super) fn work_found(&self) {
+    pub(super) fn work_found(&self, idle_state: &IdleState) {
+        // A search that succeeded before sleeping means work is arriving
+        // fast enough for spinning to pay off again.
+        if !idle_state.slept {
+            self.set_pool_idle(false);
+        }
         // If we were the last idle thread and other threads are still sleeping,
         // then we should wake up another thread.
         let threads_to_wake = self.counters.sub_inactive_thread();
@@ -159,7 +198,13 @@ impl Sleep {
             }
         }
 
-        // Successfully registered as asleep.
+        // Successfully registered as asleep. If we searched the whole spin
+        // phase without finding anything, publish that so other idle
+        // workers skip their own sweep.
+        if idle_state.spun && !idle_state.slept {
+            self.set_pool_idle(true);
+        }
+        idle_state.slept = true;
 
         // We have one last check for injected jobs to do. This protects against
         // deadlock in the very unlikely event that
@@ -190,6 +235,11 @@ impl Sleep {
 
         // Update other state:
         idle_state.wake_fully();
+        // `wake_fully` grants a fresh spin budget; honor it only if the
+        // pool no longer looks idle (a search found work since we slept).
+        if self.pool_idle.load(Ordering::Relaxed) {
+            idle_state.rounds = ROUNDS_UNTIL_SLEEPY;
+        }
         latch.wake_up();
     }
 
