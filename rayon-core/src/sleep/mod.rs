@@ -6,6 +6,7 @@ use crate::sync::{Condvar, Mutex};
 use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Instant;
 
 mod counters;
 pub(crate) use self::counters::THREADS_MAX;
@@ -25,14 +26,17 @@ pub(super) struct Sleep {
 
     counters: AtomicCounters,
 
-    /// Whether the pool looked idle to the most recent worker that
-    /// finished searching: set when a spinning worker's full sweep comes
-    /// up empty, cleared when any worker's search finds work before it
-    /// sleeps. Idle workers consult it to decide whether spinning is
-    /// currently worth it, so one worker's empty sweep spares the rest of
-    /// the pool from repeating it. Read-mostly; both transitions are
-    /// load-gated stores, so the line stays shared until the pool's state
-    /// actually changes.
+    /// Whether the pool last drained into real idleness: set when a
+    /// spinning worker's full sweep comes up empty, cleared when a worker
+    /// wakes from a *short* sleep (work arrived just past its search --
+    /// spinning would have been cheaper than the wake round-trip). Idle
+    /// workers consult it to decide whether spinning is currently worth
+    /// it, so one worker's empty sweep spares the rest of the pool from
+    /// repeating it. Deliberately NOT cleared by searches that find work:
+    /// during a parallel region work is always momentarily available, and
+    /// clearing there would re-arm every worker just in time for them all
+    /// to spin uselessly when the region ends. Read-mostly; both
+    /// transitions are load-gated stores.
     pool_idle: CachePadded<AtomicBool>,
 }
 
@@ -111,12 +115,7 @@ impl Sleep {
     }
 
     #[inline]
-    pub(super) fn work_found(&self, idle_state: &IdleState) {
-        // A search that succeeded before sleeping means work is arriving
-        // fast enough for spinning to pay off again.
-        if !idle_state.slept {
-            self.set_pool_idle(false);
-        }
+    pub(super) fn work_found(&self) {
         // If we were the last idle thread and other threads are still sleeping,
         // then we should wake up another thread.
         let threads_to_wake = self.counters.sub_inactive_thread();
@@ -228,8 +227,15 @@ impl Sleep {
             // release the mutex in the call to `wait`, so they will see this
             // boolean as true.)
             *is_blocked = true;
+            let block_start = Instant::now();
             while *is_blocked {
                 is_blocked = sleep_state.condvar.wait(is_blocked).unwrap();
+            }
+            // A short sleep means work arrived just past our search: the
+            // wake round-trip cost more than spinning would have, so
+            // re-enable spinning pool-wide. Long sleeps confirm idleness.
+            if block_start.elapsed().as_micros() < 100 {
+                self.set_pool_idle(false);
             }
         }
 
